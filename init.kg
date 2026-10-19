@@ -1,0 +1,123 @@
+manifest_version: 1
+name: "ini"
+description: "Classic INI service/mount/timer compatibility core"
+core_version: "0.1.0"
+version: "1"
+jumpstart: ">=2.0.0, <3.0.0"
+modes:
+  - "system"
+  - "user"
+
+subsystems:
+  - "core"
+  - "unit"
+  - "service"
+activation: "core"
+
+supported_ops:
+  - name: "core.verify"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "oneshot"
+      sandbox: true
+      # §13.1: under the sandbox the working directory must be writable;
+      # the private /tmp is (§13.8).
+      working_directory: "/tmp"
+      timeout: "10s"
+
+  - name: "unit.list"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "persistent"
+      timeout: "10s"
+  - name: "unit.resolve"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "persistent"
+      timeout: "5s"
+  - name: "unit.load"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "persistent"
+      timeout: "30s"
+  - name: "unit.validate"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "persistent"
+      timeout: "10s"
+  - name: "unit.translate"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "persistent"
+      timeout: "10s"
+  - name: "unit.activate"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "persistent"
+      timeout: "10m"
+  - name: "unit.deactivate"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "persistent"
+      timeout: "5m"
+
+  - name: "service.start"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "persistent"
+      timeout: "90s"
+  - name: "service.stop"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "persistent"
+      timeout: "90s"
+  - name: "service.restart"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "persistent"
+      timeout: "120s"
+  - name: "service.reload"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "persistent"
+      timeout: "90s"
+  - name: "service.kill"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "persistent"
+      timeout: "10s"
+  - name: "service.enable"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "persistent"
+      timeout: "10s"
+  - name: "service.disable"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "persistent"
+      timeout: "10s"
+  - name: "service.status"
+    backend: "exec"
+    options:
+      executable: "bin/ini-adapter"
+      mode: "persistent"
+      timeout: "10s"
+
+init {
+  print "ini core ${core.core_version} (classic INI units)"
+}

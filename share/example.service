@@ -1,0 +1,14 @@
+; Example INI unit for the "ini" compatibility core.
+; Install as /etc/jumpstart/services/example.service in system mode, or
+; ~/.config/jumpstart/services/example.service in user mode.
+
+[Unit]
+description = Example INI daemon
+after = network
+
+[Service]
+exec = /bin/sleep 1000
+execPre =
+execPost =
+terminal = false
+; reload = /bin/kill -HUP $MAINPID

@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""INI compatibility core adapter for Jumpstart (exec protocol, §17).
+
+This is an example extension core: it teaches Jumpstart the classic INI
+service layout that Jumpstart itself used before the Kongue migration.
+
+Unit files are INI documents named <unit>.service in the core's unit
+directory; the unit name is the file name without `.service`:
+
+    [Unit]
+    description = Example daemon
+
+    [Service]
+    exec = /usr/bin/sleep 1000
+    execPre =
+    execPost =
+    terminal = false
+    reload = /bin/kill -HUP $MAINPID
+
+Directories (all defined by this core, §14.1):
+
+- units: INI_CORE_CONFIG_DIR, otherwise /etc/jumpstart/services (system mode)
+  or $XDG_CONFIG_HOME/jumpstart/services, falling back to
+  $HOME/.config/jumpstart/services (user mode);
+- process state (pid and log files): INI_CORE_RUNTIME_DIR, otherwise the
+  core's runtime directory, JUMPSTART_CORE_RUNTIME_DIR (§16.2, §19.1).
+
+Protocol behaviour:
+
+- The hello offer MUST name role `adapter`, a mode (`system` or `user`) and
+  offer `jumpstart-core/1`; otherwise the adapter logs the reason to standard
+  error and exits with status 2 without replying (§17.2: there is no request
+  id to answer).
+- Requests run concurrently, each in its own thread, so status and stop
+  answer while a long unit.activate runs (§11.6, §17.6). `cancel` interrupts
+  a request at its next wait, which answers E_CANCELLED (§13.7, §17.3).
+  Every request gets exactly one response. Starting and stopping one unit is
+  guarded by a short per-unit lock inside the adapter, so unit.activate and a
+  single-unit request never spawn the same unit twice.
+- Every wait is bounded by the request's RFC 3339 deadline (§17.3); there are
+  no other timeouts. A request whose deadline passes fails with E_TIMEOUT.
+- Results contain exactly the registry fields (§12).
+"""
+
+import configparser
+import contextlib
+import datetime
+import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+PROTOCOL = "jumpstart-core/1"
+MODES = ("system", "user")
+POLL_SECONDS = 0.1  # granularity of waits; never an operation timeout
+
+# Every operation the manifest routes to this executable (see init.kg).
+OPERATIONS = [
+    "core.verify",
+    "unit.list", "unit.resolve", "unit.load", "unit.validate",
+    "unit.translate", "unit.activate", "unit.deactivate",
+    "service.start", "service.stop", "service.restart", "service.reload",
+    "service.kill", "service.enable", "service.disable", "service.status",
+]
+
+MODE = None
+
+
+def log(message):
+    sys.stderr.write("ini-adapter: %s\n" % message)
+    sys.stderr.flush()
+
+
+# ---------------------------------------------------------------------------
+# Protocol plumbing
+
+class Failure(Exception):
+    def __init__(self, code, message):
+        Exception.__init__(self, message)
+        self.code = code
+        self.message = message
+
+
+def parse_deadline(text):
+    """RFC 3339 date-time (§17.3) -> seconds since the epoch."""
+    if not isinstance(text, str) or "T" not in text.upper():
+        raise ValueError("deadline is not an RFC 3339 date-time")
+    value = text.strip()
+    if value[-1] in "zZ":
+        value = value[:-1] + "+00:00"
+    parsed = datetime.datetime.fromisoformat(value.replace("t", "T"))
+    if parsed.tzinfo is None:
+        raise ValueError("deadline lacks a time zone")
+    return parsed.timestamp()
+
+
+class Request:
+    def __init__(self, message):
+        self.id = message["id"]
+        self.op = message["op"]
+        self.unit = message.get("unit") or ""
+        self.args = message.get("args") or {}
+        self.deadline = parse_deadline(message.get("deadline"))
+        self.cancelled = threading.Event()
+
+    def remaining(self):
+        if self.cancelled.is_set():
+            raise Failure("E_CANCELLED", "cancelled on request")
+        left = self.deadline - time.time()
+        if left <= 0:
+            raise Failure("E_TIMEOUT", "deadline passed")
+        return left
+
+    def sleep(self, seconds):
+        self.cancelled.wait(min(seconds, self.remaining()))
+        self.remaining()
+
+    def run(self, argv):
+        """Run argv (no shell) within the deadline; cancellation kills it."""
+        self.remaining()
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True,
+                                   start_new_session=True)
+        while True:
+            try:
+                out, err = process.communicate(
+                    timeout=min(POLL_SECONDS, max(self.deadline - time.time(), 0.001)))
+                return process.returncode, out, err
+            except subprocess.TimeoutExpired:
+                try:
+                    self.remaining()
+                except Failure:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.communicate()
+                    raise
+
+
+def ok(request_id, result):
+    return {"type": "response", "id": request_id, "status": "ok",
+            "result": result}
+
+
+def error(request_id, code, message):
+    return {"type": "response", "id": request_id, "status": "error",
+            "error": {"code": code, "message": message}}
+
+
+# ---------------------------------------------------------------------------
+# Units
+
+def config_dir():
+    override = os.environ.get("INI_CORE_CONFIG_DIR")
+    if override:
+        return override
+    if MODE == "user":
+        base = os.environ.get("XDG_CONFIG_HOME")
+        if not base:
+            home = os.environ.get("HOME")
+            if not home:
+                raise Failure("E_BACKEND", "neither XDG_CONFIG_HOME nor HOME is set")
+            base = os.path.join(home, ".config")
+        return os.path.join(base, "jumpstart", "services")
+    return "/etc/jumpstart/services"
+
+
+def runtime_dir():
+    directory = os.environ.get("INI_CORE_RUNTIME_DIR") or \
+        os.environ.get("JUMPSTART_CORE_RUNTIME_DIR")
+    if not directory:
+        raise Failure("E_BACKEND", "JUMPSTART_CORE_RUNTIME_DIR is not set")
+    return directory
+
+
+def enable_dir():
+    return os.path.join(config_dir(), ".enabled")
+
+
+def bare(name):
+    if name.endswith(".service"):
+        return name[: -len(".service")]
+    return name
+
+
+def unit_path(name):
+    return os.path.join(config_dir(), bare(name) + ".service")
+
+
+def marker_path(name):
+    return os.path.join(enable_dir(), bare(name))
+
+
+def pid_path(name):
+    return os.path.join(runtime_dir(), bare(name) + ".pid")
+
+
+def log_path(name):
+    return os.path.join(runtime_dir(), bare(name) + ".log")
+
+
+def config_dirs():
+    found = [config_dir()]
+    if MODE == "system":
+        found.append("/lib/jumpstart/services")
+    return found
+
+
+def parse_unit(name):
+    path = unit_path(name)
+    if not os.path.isfile(path):
+        return None
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read(path)
+    return parser
+
+
+def read_pid(name):
+    try:
+        with open(pid_path(name)) as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def alive(pid):
+    if not pid or pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def enabled(name):
+    return os.path.exists(marker_path(name))
+
+
+def enablement(name):
+    return "enabled" if enabled(name) else "disabled"
+
+
+def state_of(name):
+    if parse_unit(name) is None:
+        return ("unknown", "unit file not found")
+    pid = read_pid(name)
+    if alive(pid):
+        return ("active", "")
+    if os.path.exists(pid_path(name)):
+        return ("failed", "service stopped unexpectedly")
+    return ("inactive", "")
+
+
+def unit_names():
+    names, seen = [], set()
+    for directory in config_dirs():
+        if not os.path.isdir(directory):
+            continue
+        for entry in sorted(os.listdir(directory)):
+            if not entry.endswith(".service") or entry.startswith("."):
+                continue
+            name = entry[: -len(".service")]
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+    return names
+
+
+def read_section(name, option, fallback=""):
+    parser = parse_unit(name)
+    if parser is None:
+        return fallback
+    for section in ("Service", "service"):
+        if parser.has_option(section, option):
+            return parser.get(section, option)
+    return fallback
+
+
+def remove_state(name):
+    for path in (pid_path(name), log_path(name)):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+UNIT_LOCKS = {}
+UNIT_LOCKS_GUARD = threading.Lock()
+
+
+@contextlib.contextmanager
+def unit_lock(request, name):
+    """Serialize spawning and stopping of one unit within this adapter (the
+    only caller that can race Jumpstart's own unit lock is unit.activate or
+    unit.deactivate, which take none, §11.6). The wait ends when the request
+    is cancelled or its deadline passes."""
+    with UNIT_LOCKS_GUARD:
+        lock = UNIT_LOCKS.setdefault(name, threading.RLock())
+    while not lock.acquire(timeout=POLL_SECONDS):
+        request.remaining()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def run_hook(request, name, option):
+    command = read_section(name, option)
+    if not command.strip():
+        return
+    status, out, err = request.run(shlex.split(command))
+    if out.strip():
+        log("%s %s: %s" % (name, option, out.strip()))
+    if status != 0:
+        raise Failure("E_BACKEND", "%s %s exited with status %d: %s"
+                      % (name, option, status, err.strip()[:300]))
+
+
+def spawn_service(request, name):
+    command = read_section(name, "exec")
+    if not command.strip():
+        raise Failure("E_BACKEND", "unit %s has no [Service] exec" % name)
+    run_hook(request, name, "execPre")
+    os.makedirs(runtime_dir(), exist_ok=True)
+    # The service leaves the operation's process group (§13.7).
+    with open(log_path(name), "ab") as out:
+        process = subprocess.Popen(shlex.split(command),
+                                   stdin=subprocess.DEVNULL,
+                                   stdout=out, stderr=out,
+                                   start_new_session=True, cwd="/")
+    with open(pid_path(name), "w") as handle:
+        handle.write(str(process.pid))
+    return process.pid
+
+
+def stop_service(request, name):
+    """SIGTERM the service's process group and wait for it within the
+    request's deadline; if the deadline passes or the request is cancelled,
+    SIGKILL it and report that."""
+    pid = read_pid(name)
+    if not pid or not alive(pid):
+        remove_state(name)
+        return False
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        remove_state(name)
+        return False
+    try:
+        while alive(pid):
+            request.sleep(POLL_SECONDS)
+            try:
+                os.waitpid(pid, os.WNOHANG)  # our own child after a restart
+            except ChildProcessError:
+                pass
+    except Failure:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        remove_state(name)
+        raise
+    remove_state(name)
+    run_hook(request, name, "execPost")
+    return True
+
+
+def translate(name):
+    parser = parse_unit(name)
+    if parser is None:
+        return ""
+    description = ""
+    for section in ("Unit", "unit"):
+        if parser.has_option(section, "description"):
+            description = parser.get(section, "description")
+    lines = ['description: "%s"' % description, 'type: "simple"', "service {"]
+    for option in ("execPre", "exec", "execPost"):
+        value = read_section(name, option)
+        if value.strip():
+            lines.append('  %s "%s"' % (option, value))
+    if read_section(name, "terminal", "false").lower() == "true":
+        lines.append("  terminal true")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def validate(name):
+    diagnostics = []
+    parser = parse_unit(name)
+    if parser is None:
+        return [{"name": name, "code": "E_NOT_FOUND",
+                 "message": "unit file not found"}]
+    if not read_section(name, "exec").strip():
+        diagnostics.append({"name": name, "code": "E_UNIT_STATE",
+                            "message": "missing [Service] exec"})
+    if not any(parser.has_section(s) for s in ("Unit", "unit", "Service", "service")):
+        diagnostics.append({"name": name, "code": "E_UNIT_STATE",
+                            "message": "no recognised INI sections"})
+    return diagnostics
+
+
+def parse_signal(raw):
+    """§12.3: a name such as SIGHUP or HUP, or a decimal number."""
+    if not isinstance(raw, str) or not raw:
+        raise Failure("E_USAGE", "service.kill requires signal")
+    if raw.isdigit():
+        return int(raw)
+    name = raw.upper()
+    if not name.startswith("SIG"):
+        name = "SIG" + name
+    value = getattr(signal, name, None)
+    if not isinstance(value, int) or name.startswith("SIG_"):
+        raise Failure("E_USAGE", "unknown signal: " + raw)
+    return int(value)
+
+
+def bool_arg(args, key):
+    value = args.get(key, False)
+    if isinstance(value, bool):
+        return value
+    if value in ("true", "false"):
+        return value == "true"
+    raise Failure("E_USAGE", "%s must be a boolean" % key)
+
+
+def service_status(name):
+    state, detail = state_of(name)
+    result = {"state": state, "detail": detail, "enablement": enablement(name)}
+    pid = read_pid(name)
+    if state == "active" and pid:
+        result["main_pid"] = pid
+        result["pids"] = [pid]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Operations
+
+def handle(request):
+    op = request.op
+    unit = bare(request.unit) if request.unit else ""
+    # unit.resolve is global and names its candidate in args.name (§12.2).
+    if op == "unit.resolve":
+        unit = bare(request.args.get("name") or "")
+
+    if op == "core.verify":
+        return {"installed": True, "version": "1"}
+    if op == "unit.list":
+        wanted = request.args.get("subsystem")
+        if wanted not in (None, "", "service"):
+            return {"units": []}
+        return {"units": [{"name": name, "subsystem": "service",
+                           "enablement": enablement(name)}
+                          for name in unit_names()]}
+    if op == "unit.resolve":
+        if not unit:
+            raise Failure("E_USAGE", "unit.resolve requires args.name")
+        return {"owned": os.path.isfile(unit_path(unit)), "name": unit,
+                "subsystem": "service"}
+    if op == "unit.load":
+        loaded, errors = 0, []
+        for name in unit_names():
+            issues = validate(name)
+            if issues:
+                errors.extend(issues)
+            else:
+                loaded += 1
+        return {"loaded": loaded, "errors": errors}
+    if op == "unit.activate":
+        started, failed = 0, []
+        for name in unit_names():
+            if not enabled(name):
+                continue
+            try:
+                with unit_lock(request, name):
+                    if state_of(name)[0] != "active":
+                        spawn_service(request, name)
+                started += 1
+            except Failure as exc:
+                if exc.code in ("E_TIMEOUT", "E_CANCELLED"):
+                    raise
+                failed.append({"name": name, "code": exc.code, "message": exc.message})
+            except OSError as exc:
+                failed.append({"name": name, "code": "E_BACKEND", "message": str(exc)})
+        return {"started": started, "failed": failed}
+    if op == "unit.deactivate":
+        stopped, failed = 0, []
+        for name in unit_names():
+            try:
+                with unit_lock(request, name):
+                    was_running = stop_service(request, name)
+                if was_running:
+                    stopped += 1
+            except Failure as exc:
+                if exc.code in ("E_TIMEOUT", "E_CANCELLED"):
+                    raise
+                failed.append({"name": name, "code": exc.code, "message": exc.message})
+            except OSError as exc:
+                failed.append({"name": name, "code": "E_BACKEND", "message": str(exc)})
+        return {"stopped": stopped, "failed": failed}
+
+    if op not in OPERATIONS:
+        raise Failure("E_UNSUPPORTED", "operation is not supported: " + op)
+    if not unit:
+        raise Failure("E_USAGE", op + " requires a unit")
+    if parse_unit(unit) is None:
+        raise Failure("E_NOT_FOUND", "unit not found: " + unit)
+
+    if op == "unit.validate":
+        diagnostics = validate(unit)
+        return {"valid": not diagnostics, "diagnostics": diagnostics}
+    if op == "unit.translate":
+        return {"decfile": translate(unit)}
+    if op in ("service.enable", "service.disable"):
+        now = bool_arg(request.args, "now")
+        if request.args.get("target"):
+            raise Failure("E_NOT_FOUND", "the ini core has no targets")
+        if op == "service.enable":
+            os.makedirs(enable_dir(), exist_ok=True)
+            open(marker_path(unit), "w").close()
+            if now:
+                with unit_lock(request, unit):
+                    if state_of(unit)[0] != "active":
+                        spawn_service(request, unit)
+        else:
+            try:
+                os.remove(marker_path(unit))
+            except FileNotFoundError:
+                pass
+            if now:
+                with unit_lock(request, unit):
+                    stop_service(request, unit)
+        return {}
+    if op == "service.status":
+        return service_status(unit)
+    if op == "service.start":
+        with unit_lock(request, unit):
+            if state_of(unit)[0] != "active":
+                spawn_service(request, unit)
+        return {"state": state_of(unit)[0]}
+    if op == "service.stop":
+        with unit_lock(request, unit):
+            stop_service(request, unit)
+        return {"state": state_of(unit)[0]}
+    if op == "service.restart":
+        with unit_lock(request, unit):
+            stop_service(request, unit)
+            spawn_service(request, unit)
+        return {"state": state_of(unit)[0]}
+    if op == "service.reload":
+        if state_of(unit)[0] != "active":
+            raise Failure("E_UNIT_STATE", "service is not active")
+        command = read_section(unit, "reload")
+        if not command.strip():
+            raise Failure("E_UNSUPPORTED", "unit has no reload command")
+        argv = [word.replace("$MAINPID", str(read_pid(unit)))
+                for word in shlex.split(command)]
+        status, _, err = request.run(argv)
+        if status != 0:
+            raise Failure("E_BACKEND", "reload exited with status %d: %s"
+                          % (status, err.strip()[:300]))
+        return {"state": state_of(unit)[0]}
+    if op == "service.kill":
+        signo = parse_signal(request.args.get("signal"))
+        pid = read_pid(unit)
+        if not alive(pid):
+            raise Failure("E_UNIT_STATE", "service is not active")
+        os.killpg(pid, signo)
+        return {}
+    raise Failure("E_UNSUPPORTED", "operation is not supported: " + op)
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+
+class Server:
+    """Every request runs in its own thread, so a long unit.activate never
+    blocks status, stop, or cancel (§11.6, §17.6). Jumpstart already
+    serializes mutating operations on one unit (§11.6); the adapter only
+    guards its own shared files and daemon start-up."""
+
+    def __init__(self, output):
+        self.output = output
+        self.write_lock = threading.Lock()
+        self.cond = threading.Condition()
+        self.requests = {}
+        self.threads = []
+
+    def send(self, message):
+        with self.write_lock:
+            self.output.write((json.dumps(message) + "\n").encode())
+            self.output.flush()
+
+    def finish(self, request, message):
+        with self.cond:
+            self.requests.pop(request.id, None)
+        self.send(message)
+
+    def serve(self, request):
+        try:
+            request.remaining()
+            message = ok(request.id, handle(request))
+        except Failure as exc:
+            message = error(request.id, exc.code, exc.message)
+        except Exception as exc:  # noqa: BLE001
+            message = error(request.id, "E_BACKEND", str(exc))
+        self.finish(request, message)
+
+    def submit(self, message):
+        request_id = message.get("id")
+        if not isinstance(request_id, str) or not request_id:
+            log("request without an id")
+            return
+        with self.cond:
+            if request_id in self.requests:
+                log("duplicate request id: " + request_id)
+                return
+        try:
+            request = Request(message)
+        except (KeyError, TypeError, ValueError) as exc:
+            self.send(error(request_id, "E_PROTOCOL", "invalid request: %s" % exc))
+            return
+        with self.cond:
+            self.requests[request_id] = request
+        self.threads = [t for t in self.threads if t.is_alive()]
+        thread = threading.Thread(target=self.serve, args=(request,), daemon=True)
+        self.threads.append(thread)
+        thread.start()
+
+    def cancel(self, request_id):
+        """Interrupt the request at its next wait; it answers E_CANCELLED
+        itself (§13.7)."""
+        with self.cond:
+            request = self.requests.get(request_id)
+        if request is None:
+            log("cancel for an unknown request: %s" % request_id)
+            return
+        request.cancelled.set()
+
+    def close(self):
+        """Descriptor 3 closed (§17.6): finish what was already received,
+        then exit. Jumpstart bounds this with its own cancellation."""
+        for thread in list(self.threads):
+            thread.join()
+
+
+def handshake(input_stream):
+    global MODE
+    line = input_stream.readline()
+    try:
+        hello = json.loads(line)
+    except ValueError:
+        log("malformed hello offer")
+        return None
+    if not isinstance(hello, dict) or hello.get("type") != "hello":
+        log("expected a hello offer")
+        return None
+    if hello.get("role") != "adapter":
+        log("expected role adapter, got %r" % hello.get("role"))
+        return None
+    if hello.get("mode") not in MODES:
+        log("hello offer lacks a valid mode")
+        return None
+    if PROTOCOL not in (hello.get("protocols") or []):
+        log("%s is not offered" % PROTOCOL)
+        return None
+    MODE = hello["mode"]
+    return {"type": "hello", "protocol": PROTOCOL, "role": "adapter",
+            "operations": OPERATIONS}
+
+
+def main():
+    input_stream = os.fdopen(3, "r")
+    output_stream = os.fdopen(4, "wb")
+    reply = handshake(input_stream)
+    if reply is None:
+        return 2
+    server = Server(output_stream)
+    server.send(reply)
+    status = 0
+    for line in input_stream:
+        if not line.strip():
+            continue
+        try:
+            message = json.loads(line)
+        except ValueError as exc:
+            log("malformed message: %s" % exc)
+            status = 1
+            break
+        kind = message.get("type") if isinstance(message, dict) else None
+        if kind == "request":
+            server.submit(message)
+        elif kind == "cancel":
+            server.cancel(message.get("id"))
+        else:
+            log("ignoring message of type %r" % kind)
+    server.close()
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())
